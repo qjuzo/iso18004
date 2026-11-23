@@ -3,42 +3,36 @@
   iso18004
 </h1>
 
-Zero-dependency ISO/IEC 18004 QR decoder in strict TypedArray TypeScript, paired with an off-thread SolidJS web scanner. Everything from integral-image adaptive thresholding to Berlekamp-Massey Reed-Solomon recovery runs from scratch on `Uint8Array`, `Uint32Array`, and `Float64Array` buffers.
+Zero-dependency ISO/IEC 18004 QR decoder written from scratch in TypeScript over `Uint8Array`, `Uint32Array`, and `Float64Array` buffers, paired with an off-thread SolidJS web scanner.
 
-**[Check it out → qjuzo.github.io/iso18004](https://qjuzo.github.io/iso18004)**
+Live scanner and X-Ray telemetry workbench: https://qjuzo.github.io/iso18004
 
 <p align="center">
   <a href="https://qjuzo.github.io/iso18004">
-    <img src=".github/preview.png" alt="iso18004 web scanner and X-Ray telemetry preview" width="720" />
+    <img src=".github/preview.png" alt="iso18004 optical readout, adaptive threshold view, and unwarped BitMatrix telemetry" width="760" />
   </a>
 </p>
 
-## Quick Start
+The inspector shows each frame's Bradley-Roth threshold bitmap, homography quad lock, finder/alignment sampling points, and the unwarped module grid alongside Reed-Solomon byte repair counts.
 
-### Non-Developer Launch
+## Benchmarks
 
-Requires [Node.js 22+](https://nodejs.org/).
+Measured on `400×400` RGBA buffers in Node `v24.22.1` (30 warmup iterations, 200 timed runs per workload):
 
-- **Windows:** Double-click `start.bat`
-- **macOS / Linux:** Run `./start.sh`
+| Workload | `@qr-scan/core` p50 (p95) | `jsQR` 1.4.0 p50 (p95) | RS repairs |
+| --- | --- | --- | --- |
+| Clean (`V3-M`, `29×29`) | **2.22 ms** (2.53 ms) | 5.09 ms (8.08 ms) | 0B |
+| Perspective skew (`V4-Q`, `33×33`) | **2.69 ms** (4.29 ms) | 6.38 ms (9.81 ms) | 0B |
+| Shadow gradient (`V4-Q`, damaged) | **2.29 ms** (3.27 ms) | 6.29 ms (8.68 ms) | 6B |
+| Chaos `180°` tilt + grain (`V6-H`) | **3.30 ms** (4.59 ms) | 42.33 ms (58.42 ms) | 11B |
 
-The launcher enables `pnpm`, installs dependencies on first run, compiles `@qr-scan/core`, and opens the web scanner in your default browser.
+Why it stays flat under noise and skew: hot loops operate directly on contiguous `Uint8Array`, `Uint32Array`, and `Float64Array` views instead of `number[]` allocations or per-pixel objects, and the SolidJS worker transfers `ImageData.data.buffer` via zero-copy `Transferable` messages. Reproduce the `@qr-scan/core` numbers locally with `pnpm bench`.
 
-### Developer Commands
-
-```sh
-pnpm install
-pnpm test    # Runs @qr-scan/core node --test suite
-pnpm dev     # Builds core and starts Vite dev server
-pnpm build   # Builds @qr-scan/core and @qr-scan/web
-```
-
-## Library Usage
+## Usage
 
 ```ts
 import { decode } from '@qr-scan/core';
 
-// rgba is an RGBA Uint8Array or Uint8ClampedArray (width * height * 4)
 const result = decode(rgba, width, height, {
   tryInverted: true,
   debug: false,
@@ -49,29 +43,31 @@ if (result) {
 }
 ```
 
-## Architecture
+## Running locally
 
-Decoding executes as a linear TypedArray pipeline in [`packages/core/src`](packages/core/src):
+Requires Node.js 22+ and `pnpm`:
 
-| Stage | Module | Implementation |
-| --- | --- | --- |
-| 1. Binarize | `binarize.ts` | BT.601 fixed-point luma, `Uint32Array` integral image, symmetric local adaptive threshold |
-| 2. Locate | `locator.ts` | `1:1:3:1:1` horizontal/vertical/diagonal finder scanner, cross-product triad sort, `1:1:1` alignment search |
-| 3. Unwarp | `perspective.ts` | `Float64Array` 8x9 Gaussian elimination homography solver, 5-point bilinear sub-module sampler |
-| 4. Format | `format.ts` | 15-bit BCH(15,5) format decode (`0x5412` unmask), 18-bit BCH(18,6) version decode, masks 0–7 |
-| 5. ECC | `reed-solomon.ts` | ISO 18004 Table 9 de-interleaving, GF(2^8) (`0x11d`) syndromes, Berlekamp-Massey, Chien search, Forney |
-| 6. Payload | `bitstream.ts` | Numeric, Alphanumeric, Byte (UTF-8 / ISO-8859-1 / ECI), and Shift-JIS Kanji segment parser |
+```sh
+pnpm install
+pnpm dev     # builds @qr-scan/core and starts Vite dev server
+pnpm test    # runs node --test suite in packages/core
+pnpm bench   # runs 200-iteration decode benchmark
+pnpm build   # builds core + web bundle
+```
 
-The SolidJS frontend in [`packages/web/src`](packages/web/src) transfers `ImageData.data.buffer` to `worker.ts` using zero-copy `Transferable` messages, overlays detected quads over live camera feeds or pasted/dropped images, and exposes intermediate buffers inside the Pipeline Inspector.
+On Windows or macOS/Linux without setting up commands manually, run `start.bat` or `./start.sh` from the repository root to install dependencies and launch the web app.
 
-## ISO/IEC 18004 Scope
+## Inside `packages/core`
 
-- **Versions:** 1–40 (`21×21` through `177×177`)
-- **Error Correction Levels:** L, M, Q, H (single and multi-block interleaved)
-- **Data Modes:** Numeric, Alphanumeric, Byte, Kanji, ECI, Structured Append header skip, FNC1
-- **Polarity:** Standard dark-on-light and inverted light-on-dark symbols
-- **Excluded:** Micro QR, rMQR, Structured Append multi-symbol reassembly
+- `binarize.ts`: BT.601 fixed-point luma (`(77R + 150G + 29B) >> 8`), `Uint32Array` integral image, and symmetric Bradley-Roth local thresholding.
+- `locator.ts`: horizontal, vertical, and diagonal `1:1:3:1:1` finder pattern scanner, cross-product `[TL, TR, BL]` ordering, and `1:1:1` alignment search (plus Jacobian projective 4th-corner estimation for Version 1).
+- `perspective.ts`: `Float64Array(72)` 8×9 Gaussian elimination homography solver and 5-point bilinear sub-module grid sampler.
+- `format.ts`: `BCH(15, 5)` format strip decode (`0x5412` unmask), `BCH(18, 6)` version decode (V7–V40), and masks `0–7`.
+- `reed-solomon.ts`: ISO 18004 Table 9 de-interleaving, $\text{GF}(2^8)$ (`0x11d`) syndromes, Berlekamp-Massey, Chien search, and Forney error evaluation.
+- `bitstream.ts`: Numeric, Alphanumeric, Byte (UTF-8 / ISO-8859-1 / ECI), and Shift-JIS Kanji decoder.
 
-## Trademark Notice
+Supports standard and inverted-polarity symbols across Versions 1–40 and error correction levels L, M, Q, and H. Micro QR, rMQR, and multi-symbol Structured Append reassembly are out of scope.
+
+---
 
 QR Code is a registered trademark of DENSO WAVE INCORPORATED.
