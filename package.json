@@ -1,0 +1,14 @@
+{
+  "name": "qr-scan",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "dev": "pnpm --filter @qr-scan/core build && pnpm --filter @qr-scan/web dev",
+    "start": "pnpm dev",
+    "build": "pnpm --filter @qr-scan/core build && pnpm --filter @qr-scan/web build",
+    "test": "pnpm --filter @qr-scan/core test"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.2"
+  }
+}

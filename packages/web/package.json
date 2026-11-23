@@ -1,0 +1,22 @@
+{
+  "name": "@qr-scan/web",
+  "version": "0.1.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@qr-scan/core": "workspace:*",
+    "solid-icons": "^2.0.0",
+    "solid-js": "^1.9.4"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.2",
+    "vite": "^6.2.0",
+    "vite-plugin-solid": "^2.11.0"
+  }
+}
