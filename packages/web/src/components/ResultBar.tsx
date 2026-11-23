@@ -12,7 +12,7 @@ import {
   TbOutlineTicket,
   TbOutlineWifi,
 } from 'solid-icons/tb';
-import { For, Show, createMemo, createSignal, onCleanup } from 'solid-js';
+import { For, Show, createEffect, createMemo, createSignal, onCleanup } from 'solid-js';
 import type { ActiveImageSource } from './Dropzone.tsx';
 
 export interface RecentScan {
@@ -139,6 +139,15 @@ export function ResultBar(props: ResultBarProps) {
   let resetTimer: number | undefined;
   let wifiTimer: number | undefined;
   let lastAnnounced = '';
+
+  createEffect(() => {
+    props.result;
+    window.clearTimeout(resetTimer);
+    window.clearTimeout(wifiTimer);
+    setCopyState('idle');
+    setWifiCopied(false);
+    setLiveMsg('');
+  });
 
   const validUrl = createMemo(() => {
     const r = props.result;
@@ -295,7 +304,7 @@ export function ResultBar(props: ResultBarProps) {
 
       <div class="payload-box mono" classList={{ 'is-empty': !props.result }} aria-live="polite">
         <Show when={props.result} fallback={<span>Awaiting optical lock or image input…</span>}>
-          {(res) => (hexView() ? hexDump() : res().text)}
+          {(res) => <span>{hexView() ? hexDump() : res().text}</span>}
         </Show>
       </div>
 

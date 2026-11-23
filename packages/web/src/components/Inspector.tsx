@@ -191,24 +191,28 @@ export function Inspector(props: InspectorProps) {
           <div class="xray-canvases">
             <figure class="xray-frame">
               <div class="xray-box">
-                <Show
-                  when={props.telemetry}
-                  fallback={<span class="xray-placeholder mono">No threshold frame</span>}
-                >
-                  <canvas ref={thresholdCanvas} class="xray-canvas" />
+                <Show when={!props.telemetry}>
+                  <span class="xray-placeholder mono">No threshold frame</span>
                 </Show>
+                <canvas
+                  ref={thresholdCanvas}
+                  class="xray-canvas"
+                  style={{ display: props.telemetry ? 'block' : 'none' }}
+                />
               </div>
               <figcaption class="mono">Adaptive Threshold</figcaption>
             </figure>
 
             <figure class="xray-frame">
               <div class="xray-box">
-                <Show
-                  when={props.telemetry}
-                  fallback={<span class="xray-placeholder mono">No unwarped grid</span>}
-                >
-                  <canvas ref={matrixCanvas} class="xray-canvas" />
+                <Show when={!props.telemetry}>
+                  <span class="xray-placeholder mono">No unwarped grid</span>
                 </Show>
+                <canvas
+                  ref={matrixCanvas}
+                  class="xray-canvas"
+                  style={{ display: props.telemetry ? 'block' : 'none' }}
+                />
               </div>
               <figcaption class="mono">Unwarped BitMatrix</figcaption>
             </figure>

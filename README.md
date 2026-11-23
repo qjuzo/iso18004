@@ -1,6 +1,17 @@
-# qr-scan
+<h1>
+  <img src=".github/logo.svg" alt="" width="26" height="26" align="absmiddle" />
+  iso18004
+</h1>
 
 Zero-dependency ISO/IEC 18004 QR decoder in strict TypedArray TypeScript, paired with an off-thread SolidJS web scanner. Everything from integral-image adaptive thresholding to Berlekamp-Massey Reed-Solomon recovery runs from scratch on `Uint8Array`, `Uint32Array`, and `Float64Array` buffers.
+
+**[Check it out → qjuzo.github.io/iso18004](https://qjuzo.github.io/iso18004)**
+
+<p align="center">
+  <a href="https://qjuzo.github.io/iso18004">
+    <img src=".github/preview.png" alt="iso18004 web scanner and X-Ray telemetry preview" width="720" />
+  </a>
+</p>
 
 ## Quick Start
 

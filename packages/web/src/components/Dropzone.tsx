@@ -41,7 +41,7 @@ export function Dropzone(props: DropzoneProps) {
   let fileInputEl: HTMLInputElement | undefined;
   let pulseTimer: number | undefined;
 
-  createEffect(() => {
+  function drawPreview(): void {
     const src = props.activeImage;
     const res = props.result;
     if (!src || !displayCanvas) return;
@@ -102,6 +102,10 @@ export function Dropzone(props: DropzoneProps) {
         pulseTimer = window.setTimeout(() => setPulseLock(false), 450);
       });
     }
+  }
+
+  createEffect(() => {
+    drawPreview();
   });
 
   return (
@@ -206,7 +210,10 @@ export function Dropzone(props: DropzoneProps) {
           {(img) => (
             <div class="stage-canvas-wrap" data-rev={img().revision}>
               <canvas
-                ref={displayCanvas}
+                ref={(el) => {
+                  displayCanvas = el;
+                  drawPreview();
+                }}
                 class="stage-canvas is-entering"
                 aria-label={`Scanned image ${img().label}`}
               />
