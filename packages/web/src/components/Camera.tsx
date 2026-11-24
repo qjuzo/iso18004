@@ -13,7 +13,8 @@ export interface CameraProps {
   debug: boolean;
   decodeFrame: (
     imageData: ImageData,
-    debug: boolean
+    debug: boolean,
+    opts?: { maxTimeMs?: number; maxWindows?: number; dropIfBusy?: boolean }
   ) => Promise<{ result: DecodeResult | null; elapsedMs: number }>;
   onDecode: (result: DecodeResult, elapsedMs: number, sourceLabel: string) => void;
   modeSwitchSlot: JSX.Element;
@@ -262,7 +263,7 @@ export function Camera(props: CameraProps) {
 
     inFlight = true;
     void props
-      .decodeFrame(frameData, props.debug)
+      .decodeFrame(frameData, props.debug, { maxTimeMs: 120, dropIfBusy: true })
       .then(({ result, elapsedMs }) => {
         if (result) {
           lastOverlayCorners = result.corners;

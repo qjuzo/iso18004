@@ -19,7 +19,13 @@ import { Inspector } from './components/Inspector.tsx';
 import { ResultBar, type RecentScan } from './components/ResultBar.tsx';
 import { WelcomeModal } from './components/WelcomeModal.tsx';
 import { buildSampleImageData, type SamplePreset } from './sample-qr.ts';
-import type { DecodeWorkerResponse } from './worker.ts';
+import type { DecodeWorkerRequest, DecodeWorkerResponse } from './worker.ts';
+
+export interface DecodeFrameOptions {
+  maxTimeMs?: number;
+  maxWindows?: number;
+  dropIfBusy?: boolean;
+}
 
 type InputMode = 'image' | 'camera';
 type ThemePref = 'dark' | 'light' | 'system';
@@ -84,6 +90,10 @@ export function App() {
   let nextReqId = 1;
   let nextScanId = 1;
   let nextImageRev = 1;
+  let activeImageJob = 0;
+  let workerInFlight = false;
+  let queuedJob: { req: DecodeWorkerRequest; resolve: (resp: DecodeWorkerResponse) => void } | null =
+    null;
   let dragDepth = 0;
   let secretTapCount = 0;
   let secretTimer: number | undefined;
@@ -209,28 +219,67 @@ export function App() {
     });
   }
 
+  function dispatchWorkerJob(
+    req: DecodeWorkerRequest,
+    resolve: (resp: DecodeWorkerResponse) => void
+  ): void {
+    if (!worker) {
+      workerInFlight = false;
+      resolve({ id: req.id, result: null, elapsedMs: 0 });
+      return;
+    }
+    workerInFlight = true;
+    pending.set(req.id, resolve);
+    worker.postMessage(req, [req.buffer]);
+  }
+
   function decodeFrame(
     imageData: ImageData,
-    debug: boolean
+    debug: boolean,
+    opts: DecodeFrameOptions = {}
   ): Promise<{ result: DecodeResult | null; elapsedMs: number }> {
     if (!worker) return Promise.resolve({ result: null, elapsedMs: 0 });
-    const id = nextReqId++;
-    const buffer = imageData.data.buffer;
+    if (workerInFlight && opts.dropIfBusy) {
+      return Promise.resolve({ result: null, elapsedMs: 0 });
+    }
+
+    const req: DecodeWorkerRequest = {
+      id: nextReqId++,
+      buffer: imageData.data.buffer,
+      width: imageData.width,
+      height: imageData.height,
+      debug,
+      maxTimeMs: opts.maxTimeMs,
+      maxWindows: opts.maxWindows,
+    };
+
     return new Promise((resolve) => {
-      pending.set(id, (resp) => resolve({ result: resp.result, elapsedMs: resp.elapsedMs }));
-      worker!.postMessage(
-        { id, buffer, width: imageData.width, height: imageData.height, debug },
-        [buffer]
-      );
+      const finish = (resp: DecodeWorkerResponse) =>
+        resolve({ result: resp.result, elapsedMs: resp.elapsedMs });
+
+      if (workerInFlight) {
+        if (queuedJob) {
+          queuedJob.resolve({ id: queuedJob.req.id, result: null, elapsedMs: 0 });
+        }
+        queuedJob = { req, resolve: finish };
+        return;
+      }
+
+      dispatchWorkerJob(req, finish);
     });
   }
 
   async function processBlob(blob: Blob, sourceLabel: string): Promise<void> {
+    const jobId = ++activeImageJob;
     setMode('image');
     setBusy(true);
     setStatusError('');
     try {
       const bitmap = await createImageBitmap(blob);
+      if (jobId !== activeImageJob) {
+        bitmap.close();
+        return;
+      }
       const canvas = document.createElement('canvas');
       canvas.width = bitmap.width;
       canvas.height = bitmap.height;
@@ -248,8 +297,14 @@ export function App() {
       };
       setActiveImage(imgSrc);
 
+      // Let the preview and busy indicator paint before reading large bitmaps
+      await new Promise<void>((r) => requestAnimationFrame(() => r()));
+      if (jobId !== activeImageJob) return;
+
       const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const { result: res, elapsedMs: ms } = await decodeFrame(frame, true);
+      const { result: res, elapsedMs: ms } = await decodeFrame(frame, true, { maxTimeMs: 1500 });
+      if (jobId !== activeImageJob) return;
+
       setResult(res);
       setElapsedMs(ms);
       if (res) {
@@ -260,14 +315,18 @@ export function App() {
         setStatusError(`No QR symbol found (${ms.toFixed(1)} ms)`);
       }
     } catch (err) {
+      if (jobId !== activeImageJob) return;
       setResult(null);
       setStatusError(err instanceof Error ? err.message : 'Unable to decode image');
     } finally {
-      setBusy(false);
+      if (jobId === activeImageJob) {
+        setBusy(false);
+      }
     }
   }
 
   async function processSample(preset: SamplePreset, label: string): Promise<void> {
+    const jobId = ++activeImageJob;
     setMode('image');
     setBusy(true);
     setStatusError('');
@@ -290,7 +349,9 @@ export function App() {
       setActiveImage(imgSrc);
 
       const frame = ctx.getImageData(0, 0, sample.width, sample.height);
-      const { result: res, elapsedMs: ms } = await decodeFrame(frame, true);
+      const { result: res, elapsedMs: ms } = await decodeFrame(frame, true, { maxTimeMs: 1500 });
+      if (jobId !== activeImageJob) return;
+
       setResult(res);
       setElapsedMs(ms);
       if (res) {
@@ -301,7 +362,9 @@ export function App() {
         setStatusError(`No QR symbol found (${ms.toFixed(1)} ms)`);
       }
     } finally {
-      setBusy(false);
+      if (jobId === activeImageJob) {
+        setBusy(false);
+      }
     }
   }
 
@@ -380,10 +443,28 @@ export function App() {
   onMount(() => {
     worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
     worker.addEventListener('message', (event: MessageEvent<DecodeWorkerResponse>) => {
+      workerInFlight = false;
       const resolver = pending.get(event.data.id);
       if (resolver) {
         pending.delete(event.data.id);
         resolver(event.data);
+      }
+      if (queuedJob) {
+        const next = queuedJob;
+        queuedJob = null;
+        dispatchWorkerJob(next.req, next.resolve);
+      }
+    });
+    worker.addEventListener('error', () => {
+      workerInFlight = false;
+      for (const resolver of pending.values()) {
+        resolver({ id: -1, result: null, elapsedMs: 0 });
+      }
+      pending.clear();
+      if (queuedJob) {
+        const next = queuedJob;
+        queuedJob = null;
+        dispatchWorkerJob(next.req, next.resolve);
       }
     });
 
@@ -410,6 +491,11 @@ export function App() {
       window.removeEventListener('drop', handleWindowDrop);
       window.clearTimeout(secretTimer);
       window.clearTimeout(toastTimer);
+      workerInFlight = false;
+      if (queuedJob) {
+        queuedJob.resolve({ id: queuedJob.req.id, result: null, elapsedMs: 0 });
+        queuedJob = null;
+      }
       for (const resolver of pending.values()) {
         resolver({ id: -1, result: null, elapsedMs: 0 });
       }
@@ -576,6 +662,8 @@ export function App() {
               onPasteClipboardClick={() => void handleClipboardButton()}
               onSelectSample={(preset, label) => void processSample(preset, label)}
               onClear={() => {
+                activeImageJob++;
+                setBusy(false);
                 setActiveImage(null);
                 setResult(null);
                 setElapsedMs(null);

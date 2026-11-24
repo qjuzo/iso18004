@@ -1,4 +1,4 @@
-import { decode, type DecodeResult } from '@qr-scan/core';
+import { scan, type DecodeResult } from '@qr-scan/core';
 
 export interface DecodeWorkerRequest {
   id: number;
@@ -6,6 +6,8 @@ export interface DecodeWorkerRequest {
   width: number;
   height: number;
   debug: boolean;
+  maxTimeMs?: number;
+  maxWindows?: number;
 }
 
 export interface DecodeWorkerResponse {
@@ -15,11 +17,11 @@ export interface DecodeWorkerResponse {
 }
 
 self.addEventListener('message', (event: MessageEvent<DecodeWorkerRequest>) => {
-  const { id, buffer, width, height, debug } = event.data;
+  const { id, buffer, width, height, debug, maxTimeMs, maxWindows } = event.data;
   const rgba = new Uint8ClampedArray(buffer);
 
   const t0 = performance.now();
-  const result = decode(rgba, width, height, { debug, tryInverted: true });
+  const result = scan(rgba, width, height, { debug, tryInverted: true, maxTimeMs, maxWindows });
   const elapsedMs = performance.now() - t0;
 
   const transferables: Transferable[] = [];
