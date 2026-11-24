@@ -23,6 +23,7 @@ import {
   projectPoint,
   rsDecode,
   rsGeneratorPoly,
+  scan,
   setBit,
   solveHomography,
   type BitMatrix,
@@ -618,4 +619,278 @@ test('End-to-end 45-deg / 180-deg rotation and Version 8 multi-block RS with blu
   assert.ok(res180.telemetry);
   assert.ok(res180.telemetry.blocksTotal > 1);
   assert.ok(res180.telemetry.correctedErrors > 0);
+});
+
+function buildCluttered1080pScene(width = 1920, height = 1080): Uint8Array {
+  const rgba = new Uint8Array(width * height * 4);
+  let seed = 0x9e3779b9;
+  const nextRand = (): number => {
+    seed ^= seed << 13;
+    seed ^= seed >>> 17;
+    seed ^= seed << 5;
+    return seed >>> 0;
+  };
+
+  // Base UI layout: dark sidebar + topbar, bright content cards, deterministic grain
+  for (let y = 0; y < height; y++) {
+    const inTopbar = y < 56;
+    for (let x = 0; x < width; x++) {
+      const inSidebar = x < 260;
+      const base = inTopbar || inSidebar ? 26 : (x > 1320 && y > 620 ? 34 : 236);
+      const grain = (nextRand() & 15) - 7;
+      const v = Math.max(0, Math.min(255, base + grain));
+      const idx = (y * width + x) * 4;
+      rgba[idx] = v;
+      rgba[idx + 1] = v;
+      rgba[idx + 2] = v;
+      rgba[idx + 3] = 255;
+    }
+  }
+
+  const fillRectLuma = (x0: number, y0: number, w: number, h: number, luma: number): void => {
+    const xEnd = Math.min(width, Math.max(0, x0 + w));
+    const yEnd = Math.min(height, Math.max(0, y0 + h));
+    for (let y = Math.max(0, y0); y < yEnd; y++) {
+      for (let x = Math.max(0, x0); x < xEnd; x++) {
+        const idx = (y * width + x) * 4;
+        rgba[idx] = luma;
+        rgba[idx + 1] = luma;
+        rgba[idx + 2] = luma;
+      }
+    }
+  };
+
+  // Dense synthetic text lines (1-4px strokes and gaps) across the workspace
+  for (let rowY = 84; rowY < height - 40; rowY += 22) {
+    let cursorX = rowY % 44 === 0 ? 300 : 320;
+    const darkInk = cursorX < 1300 || rowY < 620 ? 28 : 228;
+    while (cursorX < width - 60) {
+      const glyphW = 2 + (nextRand() % 5);
+      const glyphH = 8 + (nextRand() % 5);
+      fillRectLuma(cursorX, rowY, glyphW, glyphH, darkInk);
+      if ((nextRand() & 3) === 0) {
+        fillRectLuma(cursorX + 1, rowY + 2, Math.max(1, glyphW - 2), Math.max(1, glyphH - 4), 236 - darkInk);
+      }
+      cursorX += glyphW + 1 + (nextRand() % 4);
+      if ((nextRand() & 7) === 0) cursorX += 10;
+    }
+  }
+
+  // Concentric UI icon/checkbox decoys that trigger 1:1:3:1:1 scanline ratios at scattered locations
+  for (let i = 0; i < 28; i++) {
+    const u = 1 + (i % 3);
+    const ix = 310 + ((i * 197) % 1500);
+    const iy = 90 + ((i * 131) % 900);
+    fillRectLuma(ix - u, iy - u, 9 * u, 9 * u, 245);
+    fillRectLuma(ix, iy, 7 * u, 7 * u, 20);
+    fillRectLuma(ix + u, iy + u, 5 * u, 5 * u, 245);
+    fillRectLuma(ix + 2 * u, iy + 2 * u, 3 * u, 3 * u, 20);
+  }
+
+  return rgba;
+}
+
+function compositeQR(
+  baseRgba: Uint8Array,
+  frameW: number,
+  frameH: number,
+  matrix: BitMatrix,
+  qrX: number,
+  qrY: number,
+  codeSizePx: number,
+  quietPx: number,
+  opts: { supersample?: boolean; tiltPx?: number } = {}
+): Uint8Array {
+  const out = new Uint8Array(baseRgba);
+  const patchW = codeSizePx + quietPx * 2;
+  const patchH = codeSizePx + quietPx * 2;
+  const tilt = opts.tiltPx ?? 0;
+  const ss = opts.supersample ? 2 : 1;
+
+  const patch = rasterizeQR(matrix, {
+    width: patchW * ss,
+    height: patchH * ss,
+    dstCorners: [
+      { x: (quietPx + tilt) * ss, y: quietPx * ss },
+      { x: (quietPx + codeSizePx) * ss, y: (quietPx + tilt) * ss },
+      { x: quietPx * ss, y: (quietPx + codeSizePx - tilt) * ss },
+      { x: (quietPx + codeSizePx - tilt) * ss, y: (quietPx + codeSizePx) * ss },
+    ],
+  });
+
+  const patchLeft = qrX - quietPx;
+  const patchTop = qrY - quietPx;
+  let noiseSeed = (qrX * 73856093) ^ (qrY * 19349663);
+
+  for (let py = 0; py < patchH; py++) {
+    const fy = patchTop + py;
+    if (fy < 0 || fy >= frameH) continue;
+    for (let px = 0; px < patchW; px++) {
+      const fx = patchLeft + px;
+      if (fx < 0 || fx >= frameW) continue;
+      noiseSeed ^= noiseSeed << 13;
+      noiseSeed ^= noiseSeed >>> 17;
+      noiseSeed ^= noiseSeed << 5;
+      const jitter = ((noiseSeed >>> 0) % 15) - 7;
+
+      let luma = 0;
+      if (ss === 1) {
+        luma = patch.rgba[(py * patchW + px) * 4];
+      } else {
+        const w2 = patchW * 2;
+        const r0 = (py * 2) * w2;
+        const r1 = (py * 2 + 1) * w2;
+        const c0 = px * 2;
+        luma =
+          (patch.rgba[(r0 + c0) * 4] +
+            patch.rgba[(r0 + c0 + 1) * 4] +
+            patch.rgba[(r1 + c0) * 4] +
+            patch.rgba[(r1 + c0 + 1) * 4]) >>
+          2;
+      }
+
+      const dIdx = (fy * frameW + fx) * 4;
+      const v = Math.max(0, Math.min(255, luma + jitter));
+      out[dIdx] = v;
+      out[dIdx + 1] = v;
+      out[dIdx + 2] = v;
+      out[dIdx + 3] = 255;
+    }
+  }
+
+  return out;
+}
+
+test('scan() locates small QR codes inside a noisy cluttered 1920x1080 frame across scales', () => {
+  const W = 1920;
+  const H = 1080;
+  const baseScene = buildCluttered1080pScene(W, H);
+
+  const cases = [
+    {
+      label: '136px V3 code in upper-right',
+      payload: 'https://iso18004.test/desktop-136px',
+      version: 3,
+      ec: 'M' as ECLevel,
+      mask: 2,
+      qrX: 1520,
+      qrY: 140,
+      codeSizePx: 136,
+      quietPx: 12,
+    },
+    {
+      label: '92px V2 code near center UI clutter',
+      payload: 'small-92px-code-in-1080p',
+      version: 2,
+      ec: 'M' as ECLevel,
+      mask: 4,
+      qrX: 890,
+      qrY: 490,
+      codeSizePx: 92,
+      quietPx: 10,
+    },
+    {
+      label: '52px (~2.5px/module) V1 code in dark lower-right card',
+      payload: 'tiny-52px-v1',
+      version: 1,
+      ec: 'M' as ECLevel,
+      mask: 1,
+      qrX: 1640,
+      qrY: 820,
+      codeSizePx: 52,
+      quietPx: 8,
+    },
+    {
+      label: '42px (2.0px/module) V1 code in dark sidebar',
+      payload: 'micro-42px',
+      version: 1,
+      ec: 'L' as ECLevel,
+      mask: 3,
+      qrX: 84,
+      qrY: 860,
+      codeSizePx: 42,
+      quietPx: 7,
+    },
+    {
+      label: '40px (1.60px/module) anti-aliased + tilted V2 code via upscaled window fallback',
+      payload: 'upscaled-tile-40px-v2',
+      version: 2,
+      ec: 'M' as ECLevel,
+      mask: 5,
+      qrX: 410,
+      qrY: 780,
+      codeSizePx: 40,
+      quietPx: 5,
+      supersample: true,
+      tiltPx: 1,
+      requireFallback: true,
+    },
+    {
+      label: '29px (1.38px/module) V1 code in dark card',
+      payload: 'sub2px-29',
+      version: 1,
+      ec: 'M' as ECLevel,
+      mask: 0,
+      qrX: 1760,
+      qrY: 940,
+      codeSizePx: 29,
+      quietPx: 4,
+      supersample: false,
+      tiltPx: 0,
+      requireFallback: false,
+    },
+  ];
+
+  for (const c of cases) {
+    const matrix = encodeUtf8ByteQR(c.payload, c.version, c.ec, c.mask);
+    const frame = compositeQR(baseScene, W, H, matrix, c.qrX, c.qrY, c.codeSizePx, c.quietPx, {
+      supersample: 'supersample' in c ? c.supersample : false,
+      tiltPx: 'tiltPx' in c ? c.tiltPx : 0,
+    });
+
+    if ('requireFallback' in c && c.requireFallback) {
+      assert.equal(decode(frame, W, H), null, `expected full-frame decode() to miss ${c.label}`);
+      assert.equal(scan(frame, W, H, { maxWindows: 0 }), null, `expected maxWindows: 0 to stop ${c.label}`);
+    }
+
+    const res = scan(frame, W, H, { debug: true });
+    assert.ok(res, `scan() returned null for ${c.label}`);
+    assert.equal(res.text, c.payload, `payload mismatch for ${c.label}`);
+
+    const tol = c.quietPx + 4;
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+
+    for (const pt of res.corners) {
+      assert.ok(
+        pt.x >= c.qrX - tol && pt.x <= c.qrX + c.codeSizePx + tol,
+        `corner.x=${pt.x.toFixed(1)} outside [${c.qrX - tol}, ${c.qrX + c.codeSizePx + tol}] for ${c.label}`
+      );
+      assert.ok(
+        pt.y >= c.qrY - tol && pt.y <= c.qrY + c.codeSizePx + tol,
+        `corner.y=${pt.y.toFixed(1)} outside [${c.qrY - tol}, ${c.qrY + c.codeSizePx + tol}] for ${c.label}`
+      );
+      if (pt.x < minX) minX = pt.x;
+      if (pt.x > maxX) maxX = pt.x;
+      if (pt.y < minY) minY = pt.y;
+      if (pt.y > maxY) maxY = pt.y;
+    }
+
+    assert.ok(maxX - minX >= c.codeSizePx * 0.85, `detected width too small for ${c.label}`);
+    assert.ok(maxY - minY >= c.codeSizePx * 0.85, `detected height too small for ${c.label}`);
+
+    assert.ok(res.telemetry);
+    assert.equal(res.telemetry.width, W);
+    assert.equal(res.telemetry.height, H);
+    for (const f of res.telemetry.finders) {
+      assert.ok(
+        f.x >= c.qrX && f.x <= c.qrX + c.codeSizePx && f.y >= c.qrY && f.y <= c.qrY + c.codeSizePx,
+        `telemetry finder (${f.x.toFixed(1)}, ${f.y.toFixed(1)}) outside code box for ${c.label}`
+      );
+    }
+  }
+
+  assert.equal(scan(baseScene, W, H, { maxTimeMs: 0 }), null);
 });

@@ -23,6 +23,11 @@ export interface DecodeOptions {
   tryInverted?: boolean;
 }
 
+export interface ScanOptions extends DecodeOptions {
+  maxTimeMs?: number;
+  maxWindows?: number;
+}
+
 export interface Telemetry {
   binarized: Uint8Array;
   width: number;

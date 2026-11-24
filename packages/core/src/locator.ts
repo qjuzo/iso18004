@@ -303,33 +303,67 @@ export function findFinderPatterns(
   return candidates;
 }
 
+function selectCandidatePool(candidates: FinderPattern[], limit = 90): FinderPattern[] {
+  if (candidates.length <= limit) {
+    return candidates.slice().sort((a, b) => a.size - b.size);
+  }
+
+  // Partition by log-scale module size so high-count UI text at one scale cannot starve another
+  const buckets = new Map<number, FinderPattern[]>();
+  for (let i = 0; i < candidates.length; i++) {
+    const c = candidates[i];
+    const band = Math.max(0, Math.min(12, Math.floor(Math.log2(Math.max(0.5, c.size)) * 2 + 2)));
+    let list = buckets.get(band);
+    if (!list) {
+      list = [];
+      buckets.set(band, list);
+    }
+    list.push(c);
+  }
+
+  const perBand = Math.max(12, Math.ceil(limit / Math.max(1, buckets.size)));
+  const pooled: FinderPattern[] = [];
+  for (const list of buckets.values()) {
+    list.sort((a, b) => b.count - a.count);
+    const take = Math.min(list.length, perBand);
+    for (let i = 0; i < take; i++) pooled.push(list[i]);
+  }
+
+  if (pooled.length > limit) {
+    pooled.sort((a, b) => b.count - a.count);
+    pooled.length = limit;
+  }
+
+  return pooled.sort((a, b) => a.size - b.size);
+}
+
 export function selectFinderTriads(
   candidates: FinderPattern[],
   maxTriads = 3
 ): [FinderPattern, FinderPattern, FinderPattern][] {
   if (candidates.length < 3) return [];
 
-  const confirmed = candidates.filter((c) => c.count >= 2);
-  const pool = (confirmed.length >= 3 ? confirmed : candidates)
-    .slice()
-    .sort((a, b) => b.count - a.count)
-    .slice(0, 15);
+  const pool = selectCandidatePool(candidates, 90);
 
   const scored: {
     triad: [FinderPattern, FinderPattern, FinderPattern];
     score: number;
   }[] = [];
 
-  for (let i = 0; i < pool.length; i++) {
-    for (let j = i + 1; j < pool.length; j++) {
-      for (let k = j + 1; k < pool.length; k++) {
-        const p0 = pool[i];
-        const p1 = pool[j];
-        const p2 = pool[k];
+  for (let i = 0; i < pool.length - 2; i++) {
+    const p0 = pool[i];
+    const maxAllowedSize = p0.size * 1.75;
 
-        const minSize = Math.min(p0.size, p1.size, p2.size);
-        const maxSize = Math.max(p0.size, p1.size, p2.size);
-        if (maxSize > minSize * 1.75) continue;
+    for (let j = i + 1; j < pool.length - 1; j++) {
+      const p1 = pool[j];
+      if (p1.size > maxAllowedSize) break;
+
+      for (let k = j + 1; k < pool.length; k++) {
+        const p2 = pool[k];
+        if (p2.size > maxAllowedSize) break;
+
+        const minSize = p0.size;
+        const maxSize = p2.size;
 
         const d01 = Math.hypot(p0.x - p1.x, p0.y - p1.y);
         const d12 = Math.hypot(p1.x - p2.x, p1.y - p2.y);
@@ -381,10 +415,11 @@ export function selectFinderTriads(
         const tr = cross > 0 ? a : b;
         const bl = cross > 0 ? b : a;
 
-        const countBonus = p0.count + p1.count + p2.count;
+        // Cap per-finder scanline count bonus so repetitive UI borders cannot outweigh right-angle geometry
+        const countBonus = Math.min(4, p0.count) + Math.min(4, p1.count) + Math.min(4, p2.count);
         const sizePenalty = (maxSize - minSize) / minSize;
-        const geomPenalty = (legRatio - 1) * 4 + Math.abs(cosTheta) * 5 + sizePenalty * 6;
-        const score = countBonus - geomPenalty * 3;
+        const geomPenalty = (legRatio - 1) * 14 + Math.abs(cosTheta) * 16 + sizePenalty * 18;
+        const score = countBonus * 1.5 - geomPenalty;
 
         scored.push({ triad: [tl, tr, bl], score });
       }

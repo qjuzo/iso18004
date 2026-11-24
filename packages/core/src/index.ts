@@ -32,6 +32,7 @@ export { EXP_TABLE, LOG_TABLE, gfDiv, gfInv, gfMul, gfPow, polyMul, polyRest, rs
 export { findAlignmentPattern, findFinderPatterns, selectFinderTriad, selectFinderTriads } from './locator.ts';
 export { projectPoint, sampleGrid, solveHomography } from './perspective.ts';
 export { deinterleaveAndCorrect, getBlockSpec, rsDecode } from './reed-solomon.ts';
+export { scan } from './scan.ts';
 
 function estimateProvisionalVersion(
   binarized: Uint8Array,
@@ -196,7 +197,7 @@ function decodeBinarized(
   debug: boolean
 ): DecodeResult | null {
   const candidates = findFinderPatterns(binarized, width, height);
-  const triads = selectFinderTriads(candidates, 3);
+  const triads = selectFinderTriads(candidates, 12);
 
   for (let t = 0; t < triads.length; t++) {
     const [tl, tr, bl] = triads[t];
@@ -268,6 +269,59 @@ function decodeBinarized(
   return null;
 }
 
+export interface DecodeLumaOptions extends DecodeOptions {
+  windowRadius?: number;
+  buffers?: {
+    integral: Uint32Array;
+    binarized: Uint8Array;
+  };
+  invertOnly?: boolean;
+}
+
+export function decodeLuma(
+  luma: Uint8Array,
+  width: number,
+  height: number,
+  opts: DecodeLumaOptions = {}
+): DecodeResult | null {
+  if (width <= 0 || height <= 0 || luma.length < width * height) {
+    return null;
+  }
+
+  const debug = opts.debug === true;
+  const tryInverted = opts.tryInverted !== false;
+  const invertOnly = opts.invertOnly === true;
+  const windowRadius = opts.windowRadius;
+  const integralScratch = opts.buffers?.integral;
+  const binScratch = opts.buffers?.binarized;
+
+  const integral = buildIntegralImage(luma, width, height, integralScratch);
+
+  if (!invertOnly) {
+    const normalBin = binarizeLuma(luma, integral, width, height, false, windowRadius, binScratch);
+    const normalHit = decodeBinarized(normalBin, width, height, debug);
+    if (normalHit) {
+      if (debug && normalHit.telemetry && binScratch) {
+        normalHit.telemetry.binarized = normalBin.slice(0, width * height);
+      }
+      return normalHit;
+    }
+  }
+
+  if (invertOnly || tryInverted) {
+    const invertedBin = binarizeLuma(luma, integral, width, height, true, windowRadius, binScratch);
+    const invertedHit = decodeBinarized(invertedBin, width, height, debug);
+    if (invertedHit) {
+      if (debug && invertedHit.telemetry && binScratch) {
+        invertedHit.telemetry.binarized = invertedBin.slice(0, width * height);
+      }
+      return invertedHit;
+    }
+  }
+
+  return null;
+}
+
 export function decode(
   rgba: Uint8Array | Uint8ClampedArray,
   width: number,
@@ -278,21 +332,6 @@ export function decode(
     return null;
   }
 
-  const debug = opts.debug === true;
-  const tryInverted = opts.tryInverted !== false;
-
   const luma = rgbaToLuma(rgba, width, height);
-  const integral = buildIntegralImage(luma, width, height);
-
-  const normalBin = binarizeLuma(luma, integral, width, height, false);
-  const normalHit = decodeBinarized(normalBin, width, height, debug);
-  if (normalHit) return normalHit;
-
-  if (tryInverted) {
-    const invertedBin = binarizeLuma(luma, integral, width, height, true);
-    const invertedHit = decodeBinarized(invertedBin, width, height, debug);
-    if (invertedHit) return invertedHit;
-  }
-
-  return null;
+  return decodeLuma(luma, width, height, opts);
 }
