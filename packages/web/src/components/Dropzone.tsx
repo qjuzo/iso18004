@@ -7,9 +7,11 @@ import {
   TbOutlineQrcode,
   TbOutlineTrash,
   TbOutlineUpload,
+  TbOutlineZoomReset,
 } from 'solid-icons/tb';
-import { Show, createEffect, createSignal, type JSX } from 'solid-js';
+import { Show, createEffect, createMemo, createSignal, onCleanup, type JSX } from 'solid-js';
 import type { SamplePreset } from '../sample-qr.ts';
+import { IDENTITY_ZOOM, computeZoomTransform, drawSpotlightMask, toZoomCss } from '../zoom.ts';
 
 export interface ActiveImageSource {
   canvas: HTMLCanvasElement;
@@ -37,9 +39,43 @@ export interface DropzoneProps {
 export function Dropzone(props: DropzoneProps) {
   const [draggingLocal, setDraggingLocal] = createSignal(false);
   const [pulseLock, setPulseLock] = createSignal(false);
+  const [zoomReset, setZoomReset] = createSignal(false);
+  const [vpSize, setVpSize] = createSignal({ w: 0, h: 0 });
+  const [wrapEl, setWrapEl] = createSignal<HTMLDivElement | null>(null);
   let displayCanvas: HTMLCanvasElement | undefined;
   let fileInputEl: HTMLInputElement | undefined;
   let pulseTimer: number | undefined;
+  let lastRevision = -1;
+
+  createEffect(() => {
+    const rev = props.activeImage?.revision ?? -1;
+    if (rev !== lastRevision) {
+      lastRevision = rev;
+      setZoomReset(false);
+    }
+  });
+
+  createEffect(() => {
+    const el = wrapEl();
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      const rect = entries[0]?.contentRect;
+      if (rect) setVpSize({ w: rect.width, h: rect.height });
+    });
+    ro.observe(el);
+    setVpSize({ w: el.clientWidth, h: el.clientHeight });
+    onCleanup(() => ro.disconnect());
+  });
+
+  onCleanup(() => window.clearTimeout(pulseTimer));
+
+  const zoom = createMemo(() => {
+    const src = props.activeImage;
+    const res = props.result;
+    const vp = vpSize();
+    if (!src || !res || zoomReset()) return IDENTITY_ZOOM;
+    return computeZoomTransform(res.corners, src.width, src.height, vp.w, vp.h, 2.0, 1.9);
+  });
 
   function drawPreview(): void {
     const src = props.activeImage;
@@ -55,6 +91,10 @@ export function Dropzone(props: DropzoneProps) {
     ctx.drawImage(src.canvas, 0, 0);
 
     if (res) {
+      if (!zoomReset()) {
+        drawSpotlightMask(ctx, src.width, src.height, res.corners);
+      }
+
       const c = res.corners;
       const lineW = Math.max(2.5, Math.min(src.width, src.height) * 0.007);
       ctx.save();
@@ -151,6 +191,18 @@ export function Dropzone(props: DropzoneProps) {
             }}
           />
 
+          <Show when={props.activeImage && props.result && !zoomReset()}>
+            <button
+              type="button"
+              class="btn"
+              onClick={() => setZoomReset(true)}
+              aria-label="Reset zoom"
+            >
+              <TbOutlineZoomReset size={15} aria-hidden="true" />
+              <span>Reset Zoom</span>
+            </button>
+          </Show>
+
           <Show when={props.activeImage}>
             <button type="button" class="btn" onClick={props.onClear} aria-label="Clear active image">
               <TbOutlineTrash size={15} aria-hidden="true" />
@@ -208,15 +260,26 @@ export function Dropzone(props: DropzoneProps) {
           }
         >
           {(img) => (
-            <div class="stage-canvas-wrap" data-rev={img().revision}>
-              <canvas
-                ref={(el) => {
-                  displayCanvas = el;
-                  drawPreview();
-                }}
-                class="stage-canvas is-entering"
-                aria-label={`Scanned image ${img().label}`}
-              />
+            <div
+              ref={(el) => {
+                setWrapEl(el);
+                onCleanup(() => {
+                  if (wrapEl() === el) setWrapEl(null);
+                });
+              }}
+              class="stage-canvas-wrap"
+              data-rev={img().revision}
+            >
+              <div class="stage-zoom-layer" style={{ transform: toZoomCss(zoom()) }}>
+                <canvas
+                  ref={(el) => {
+                    displayCanvas = el;
+                    drawPreview();
+                  }}
+                  class="stage-canvas is-entering"
+                  aria-label={`Scanned image ${img().label}`}
+                />
+              </div>
             </div>
           )}
         </Show>
