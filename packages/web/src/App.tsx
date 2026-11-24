@@ -296,6 +296,8 @@ export function App() {
         revision: nextImageRev++,
       };
       setActiveImage(imgSrc);
+      setResult(null);
+      setElapsedMs(null);
 
       // Let the preview and busy indicator paint before reading large bitmaps
       await new Promise<void>((r) => requestAnimationFrame(() => r()));
@@ -347,6 +349,8 @@ export function App() {
         revision: nextImageRev++,
       };
       setActiveImage(imgSrc);
+      setResult(null);
+      setElapsedMs(null);
 
       const frame = ctx.getImageData(0, 0, sample.width, sample.height);
       const { result: res, elapsedMs: ms } = await decodeFrame(frame, true, { maxTimeMs: 1500 });

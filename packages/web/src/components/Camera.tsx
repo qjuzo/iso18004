@@ -5,8 +5,10 @@ import {
   TbOutlinePlayerPause,
   TbOutlinePlayerPlay,
   TbOutlineSwitchHorizontal,
+  TbOutlineZoomReset,
 } from 'solid-icons/tb';
 import { Show, createMemo, createSignal, onCleanup, onMount, type JSX } from 'solid-js';
+import { IDENTITY_ZOOM, computeZoomTransform, drawSpotlightMask, toZoomCss, type ZoomTransform } from '../zoom.ts';
 import { CameraSelect, type CameraOption } from './CameraSelect.tsx';
 
 export interface CameraProps {
@@ -32,11 +34,17 @@ export function Camera(props: CameraProps) {
   const [fps, setFps] = createSignal(0);
   const [hasLock, setHasLock] = createSignal(false);
   const [lockPulse, setLockPulse] = createSignal(false);
+  const [zoom, setZoom] = createSignal<ZoomTransform>(IDENTITY_ZOOM);
+  const [zoomReset, setZoomReset] = createSignal(false);
 
+  let boxEl: HTMLDivElement | undefined;
   let videoEl: HTMLVideoElement | undefined;
   let overlayEl: HTMLCanvasElement | undefined;
   let captureCanvas: HTMLCanvasElement | undefined;
   let stream: MediaStream | null = null;
+  let boxRo: ResizeObserver | undefined;
+  let boxW = 0;
+  let boxH = 0;
   let rafId = 0;
   let inFlight = false;
   let lastOverlayCorners: [Point, Point, Point, Point] | null = null;
@@ -89,6 +97,8 @@ export function Camera(props: CameraProps) {
     lastLockedText = '';
     setHasLock(false);
     setFrozen(false);
+    setZoom(IDENTITY_ZOOM);
+    setZoomReset(false);
     inFlight = false;
   }
 
@@ -154,6 +164,7 @@ export function Camera(props: CameraProps) {
     if (next) {
       videoEl.pause();
     } else {
+      setZoomReset(false);
       void videoEl.play();
     }
   }
@@ -179,23 +190,56 @@ export function Camera(props: CameraProps) {
     const visible = lastOverlayCorners && (frozen() || now - lastSeenAt < 400);
     setHasLock(Boolean(visible));
 
-    if (!visible || !lastOverlayCorners || lastCapW <= 0 || lastCapH <= 0) return;
+    if (!visible || !lastOverlayCorners || lastCapW <= 0 || lastCapH <= 0) {
+      if (zoom().active) setZoom(IDENTITY_ZOOM);
+      lastLockedText = '';
+      setZoomReset(false);
+      return;
+    }
 
     const containScale = Math.min(ow / vw, oh / vh);
     const offsetX = (ow - vw * containScale) * 0.5;
     const offsetY = (oh - vh * containScale) * 0.5;
     const mapX = (cx: number) => offsetX + (cx * vw / lastCapW) * containScale;
     const mapY = (cy: number) => offsetY + (cy * vh / lastCapH) * containScale;
+    const mappedQuad: [Point, Point, Point, Point] = [
+      { x: mapX(lastOverlayCorners[0].x), y: mapY(lastOverlayCorners[0].y) },
+      { x: mapX(lastOverlayCorners[1].x), y: mapY(lastOverlayCorners[1].y) },
+      { x: mapX(lastOverlayCorners[2].x), y: mapY(lastOverlayCorners[2].y) },
+      { x: mapX(lastOverlayCorners[3].x), y: mapY(lastOverlayCorners[3].y) },
+    ];
+
+    if (!zoomReset()) {
+      drawSpotlightMask(ctx, ow, oh, mappedQuad);
+      const target = computeZoomTransform(
+        lastOverlayCorners,
+        lastCapW,
+        lastCapH,
+        boxW || ow,
+        boxH || oh,
+        2.0,
+        1.9
+      );
+      const cur = zoom();
+      if (
+        cur.active !== target.active ||
+        (target.active &&
+          (Math.abs(target.scale - cur.scale) > 0.12 ||
+            Math.hypot(target.tx - cur.tx, target.ty - cur.ty) > 14))
+      ) {
+        setZoom(target);
+      }
+    }
 
     ctx.save();
     ctx.strokeStyle = '#10B981';
     ctx.lineWidth = 2.5;
     ctx.lineJoin = 'round';
     ctx.beginPath();
-    ctx.moveTo(mapX(lastOverlayCorners[0].x), mapY(lastOverlayCorners[0].y));
-    ctx.lineTo(mapX(lastOverlayCorners[1].x), mapY(lastOverlayCorners[1].y));
-    ctx.lineTo(mapX(lastOverlayCorners[2].x), mapY(lastOverlayCorners[2].y));
-    ctx.lineTo(mapX(lastOverlayCorners[3].x), mapY(lastOverlayCorners[3].y));
+    ctx.moveTo(mappedQuad[0].x, mappedQuad[0].y);
+    ctx.lineTo(mappedQuad[1].x, mappedQuad[1].y);
+    ctx.lineTo(mappedQuad[2].x, mappedQuad[2].y);
+    ctx.lineTo(mappedQuad[3].x, mappedQuad[3].y);
     ctx.closePath();
     ctx.stroke();
 
@@ -205,7 +249,7 @@ export function Camera(props: CameraProps) {
     ctx.fillStyle = '#10B981';
     for (let i = 0; i < 4; i++) {
       ctx.beginPath();
-      ctx.arc(mapX(lastOverlayCorners[i].x), mapY(lastOverlayCorners[i].y), 4.5, 0, Math.PI * 2);
+      ctx.arc(mappedQuad[i].x, mappedQuad[i].y, 4.5, 0, Math.PI * 2);
       ctx.fill();
     }
 
@@ -273,6 +317,7 @@ export function Camera(props: CameraProps) {
           lastSeenAt = performance.now();
           if (result.text !== lastLockedText) {
             lastLockedText = result.text;
+            setZoomReset(false);
             window.clearTimeout(pulseTimer);
             setLockPulse(false);
             requestAnimationFrame(() => {
@@ -299,11 +344,24 @@ export function Camera(props: CameraProps) {
   }
 
   onMount(() => {
+    if (boxEl) {
+      boxRo = new ResizeObserver((entries) => {
+        const rect = entries[0]?.contentRect;
+        if (rect) {
+          boxW = rect.width;
+          boxH = rect.height;
+        }
+      });
+      boxRo.observe(boxEl);
+      boxW = boxEl.clientWidth;
+      boxH = boxEl.clientHeight;
+    }
     window.addEventListener('keydown', onWindowKeyDown);
     void startCamera();
   });
 
   onCleanup(() => {
+    boxRo?.disconnect();
     window.removeEventListener('keydown', onWindowKeyDown);
     window.clearTimeout(pulseTimer);
     stopStream();
@@ -348,6 +406,21 @@ export function Camera(props: CameraProps) {
             <span>{frozen() ? 'Resume' : 'Freeze'}</span>
           </button>
 
+          <Show when={hasLock() && !zoomReset()}>
+            <button
+              type="button"
+              class="btn"
+              onClick={() => {
+                setZoomReset(true);
+                setZoom(IDENTITY_ZOOM);
+              }}
+              aria-label="Reset zoom"
+            >
+              <TbOutlineZoomReset size={15} aria-hidden="true" />
+              <span>Reset Zoom</span>
+            </button>
+          </Show>
+
           <Show
             when={status() === 'active'}
             fallback={
@@ -380,15 +453,17 @@ export function Camera(props: CameraProps) {
         <span class="reticle reticle-bl" aria-hidden="true" />
         <span class="reticle reticle-br" aria-hidden="true" />
 
-        <div class="camera-box">
-          <video
-            ref={videoEl}
-            class="camera-video"
-            muted
-            playsinline
-            aria-label="Live camera viewfinder"
-          />
-          <canvas ref={overlayEl} class="camera-overlay" aria-hidden="true" />
+        <div ref={boxEl} class="camera-box">
+          <div class="camera-zoom-layer" style={{ transform: toZoomCss(zoom()) }}>
+            <video
+              ref={videoEl}
+              class="camera-video"
+              muted
+              playsinline
+              aria-label="Live camera viewfinder"
+            />
+            <canvas ref={overlayEl} class="camera-overlay" aria-hidden="true" />
+          </div>
 
           <Show when={status() !== 'active'}>
             <div class="camera-fallback" role="status">

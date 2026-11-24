@@ -13,8 +13,6 @@ Live scanner and X-Ray telemetry workbench: https://qjuzo.github.io/iso18004
   </a>
 </p>
 
-The inspector shows each frame's Bradley-Roth threshold bitmap, homography quad lock, finder/alignment sampling points, and the unwarped module grid alongside Reed-Solomon byte repair counts.
-
 ## Benchmarks
 
 Measured on `400×400` RGBA buffers in Node `v24.22.1` (30 warmup iterations, 200 timed runs per workload):
@@ -26,26 +24,40 @@ Measured on `400×400` RGBA buffers in Node `v24.22.1` (30 warmup iterations, 20
 | Shadow gradient (`V4-Q`, damaged) | **2.29 ms** (3.27 ms) | 6.29 ms (8.68 ms) | 6B |
 | Chaos `180°` tilt + grain (`V6-H`) | **3.30 ms** (4.59 ms) | 42.33 ms (58.42 ms) | 11B |
 
-Why it stays flat under noise and skew: hot loops operate directly on contiguous `Uint8Array`, `Uint32Array`, and `Float64Array` views instead of `number[]` allocations or per-pixel objects, and the SolidJS worker transfers `ImageData.data.buffer` via zero-copy `Transferable` messages. Reproduce the `@qr-scan/core` numbers locally with `pnpm bench`.
+## Design
+
+- Hot loops operate directly on contiguous `Uint8Array`, `Uint32Array`, and `Float64Array` views instead of `number[]` allocations or per-pixel objects.
+- `buildIntegralImage` guards 32-bit unsigned sums up to `16,843,009` pixels (`MAX_U32_INTEGRAL_PIXELS`) and switches to `Float64Array` above that limit.
+- The web scanner decodes off the main thread in a Web Worker and transfers `ImageData.data.buffer` and telemetry arrays with zero-copy `Transferable` messages.
+- Reproduce the `@qr-scan/core` benchmark numbers locally with `pnpm bench`.
 
 ## Usage
 
-```ts
-import { decode } from '@qr-scan/core';
+Use `scan()` for general images (screenshots, high-resolution photos, or camera frames). It runs a fast full-frame `decode()` pass first, downsamples oversized images via a 2x luma pyramid from coarse to fine, and falls back to overlapping upscaled/native tiles within `maxTimeMs` / `maxWindows`. Call `decode()` directly when you only want a single full-frame pass.
 
-const result = decode(rgba, width, height, {
+```ts
+import { decode, scan } from '@qr-scan/core';
+
+const result = scan(rgba, width, height, {
   tryInverted: true,
   debug: false,
+  maxTimeMs: 1500,
 });
 
 if (result) {
   console.log(result.text, result.version, result.ecLevel, result.corners);
 }
+
+// Single-pass decode without pyramid or tiled fallback:
+const direct = decode(rgba, width, height, { tryInverted: true });
 ```
 
-## Running locally
+## Quick start (no setup knowledge needed)
 
-Requires Node.js 22+ and `pnpm`:
+- **Windows:** run `start.bat` from the repo root. It checks for Node.js and `pnpm` (enabling `corepack` if needed), installs dependencies on first run, builds `@qr-scan/core`, and opens the local web scanner.
+- **macOS / Linux:** run `./start.sh` from the repo root for the same setup and browser launch steps.
+
+For development workflows (Node.js 22+ and `pnpm`):
 
 ```sh
 pnpm install
@@ -55,18 +67,21 @@ pnpm bench   # runs 200-iteration decode benchmark
 pnpm build   # builds core + web bundle
 ```
 
-On Windows or macOS/Linux without setting up commands manually, run `start.bat` or `./start.sh` from the repository root to install dependencies and launch the web app.
-
 ## Inside `packages/core`
 
-- `binarize.ts`: BT.601 fixed-point luma (`(77R + 150G + 29B) >> 8`), `Uint32Array` integral image, and symmetric Bradley-Roth local thresholding.
-- `locator.ts`: horizontal, vertical, and diagonal `1:1:3:1:1` finder pattern scanner, cross-product `[TL, TR, BL]` ordering, and `1:1:1` alignment search (plus Jacobian projective 4th-corner estimation for Version 1).
-- `perspective.ts`: `Float64Array(72)` 8×9 Gaussian elimination homography solver and 5-point bilinear sub-module grid sampler.
-- `format.ts`: `BCH(15, 5)` format strip decode (`0x5412` unmask), `BCH(18, 6)` version decode (V7–V40), and masks `0–7`.
-- `reed-solomon.ts`: ISO 18004 Table 9 de-interleaving, $\text{GF}(2^8)$ (`0x11d`) syndromes, Berlekamp-Massey, Chien search, and Forney error evaluation.
-- `bitstream.ts`: Numeric, Alphanumeric, Byte (UTF-8 / ISO-8859-1 / ECI), and Shift-JIS Kanji decoder.
+- `binarize.ts`: BT.601 luma conversion, integral-image accumulation (`Uint32Array` / `Float64Array`), and adaptive local thresholding.
+- `locator.ts`: `1:1:3:1:1` finder scanning, candidate pooling, triad ordering, alignment search, and projective corner estimation.
+- `perspective.ts`: planar homography solver and bilinear sub-module grid sampler.
+- `format.ts`: BCH format/version strip decoding and data mask evaluation across Versions 1–40.
+- `reed-solomon.ts`: GF(256) block de-interleaving and Berlekamp-Massey / Forney error correction.
+- `bitstream.ts`: Numeric, Alphanumeric, Byte (UTF-8 / ISO-8859-1 / ECI), and Shift-JIS Kanji segment decoder.
+- `scan.ts`: multi-scale 2x pyramid, overlapping windowed fallback, time/window budgeting, and full-frame coordinate mapping.
 
-Supports standard and inverted-polarity symbols across Versions 1–40 and error correction levels L, M, Q, and H. Micro QR, rMQR, and multi-symbol Structured Append reassembly are out of scope.
+## Limitations
+
+- Standard QR symbols (Versions 1–40, EC levels L/M/Q/H, normal and inverted polarity) only; Micro QR, rMQR, and multi-symbol Structured Append reassembly are not supported.
+- `scan()` aborts and returns `null` when its budget (`maxTimeMs`, default `1500` ms, or `maxWindows`) is exhausted before finding a valid code.
+- Very small (`< ~1.5 px/module`), heavily motion-blurred, or near-zero-contrast symbols may fail binarization or finder detection.
 
 ---
 
