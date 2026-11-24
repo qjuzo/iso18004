@@ -24,6 +24,10 @@ Measured on `400×400` RGBA buffers in Node `v24.22.1` (30 warmup iterations, 20
 | Shadow gradient (`V4-Q`, damaged) | **2.29 ms** (3.27 ms) | 6.29 ms (8.68 ms) | 6B |
 | Chaos `180°` tilt + grain (`V6-H`) | **3.30 ms** (4.59 ms) | 42.33 ms (58.42 ms) | 11B |
 
+- **Environment:** AMD Ryzen 5 5600G with Radeon Graphics (12 threads), Windows 10 (`win32` `x64`, `NT 10.0.19045.0`), Node `v24.22.1`.
+- **Script:** [`scripts/bench.mts`](scripts/bench.mts) (`pnpm bench`).
+- **Inputs:** Synthetic `400×400` RGBA buffers generated from the `clean`, `skewed`, `damaged`, and `chaos` presets.
+
 ## Design
 
 - Hot loops operate directly on contiguous `Uint8Array`, `Uint32Array`, and `Float64Array` views instead of `number[]` allocations or per-pixel objects.
