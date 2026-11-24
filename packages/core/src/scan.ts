@@ -1,6 +1,58 @@
-import { binarizeLuma, buildIntegralImage, rgbaToLuma } from './binarize.ts';
+import { MAX_U32_INTEGRAL_PIXELS, binarizeLuma, buildIntegralImage, rgbaToLuma } from './binarize.ts';
 import { decodeLuma } from './index.ts';
 import type { DecodeResult, Point, ScanOptions } from './types.ts';
+
+const MAX_FULL_RES_DECODE_PIXELS = 2_500_000;
+
+interface PyramidLevel {
+  luma: Uint8Array;
+  width: number;
+  height: number;
+  factor: number;
+}
+
+interface TilePlan {
+  tileW: number;
+  tileH: number;
+  scale: number;
+  coords: { tx: number; ty: number; dist2: number }[];
+}
+
+function downsample2x(src: Uint8Array, srcW: number, srcH: number): {
+  luma: Uint8Array;
+  width: number;
+  height: number;
+} {
+  const width = srcW >> 1;
+  const height = srcH >> 1;
+  const luma = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) {
+    const r0 = (y << 1) * srcW;
+    const r1 = r0 + srcW;
+    const dstRow = y * width;
+    for (let x = 0; x < width; x++) {
+      const x2 = x << 1;
+      luma[dstRow + x] =
+        (src[r0 + x2] + src[r0 + x2 + 1] + src[r1 + x2] + src[r1 + x2 + 1] + 2) >> 2;
+    }
+  }
+  return { luma, width, height };
+}
+
+function copyTile(
+  srcLuma: Uint8Array,
+  srcStride: number,
+  tx: number,
+  ty: number,
+  tileW: number,
+  tileH: number,
+  dst: Uint8Array
+): void {
+  for (let y = 0; y < tileH; y++) {
+    const srcRow = (ty + y) * srcStride + tx;
+    dst.set(srcLuma.subarray(srcRow, srcRow + tileW), y * tileW);
+  }
+}
 
 function buildAxisPositions(limit: number, tileSize: number): Int32Array {
   if (tileSize >= limit) return new Int32Array([0]);
@@ -127,19 +179,36 @@ function mapResultToFrame(
 
   if (hit.telemetry) {
     const tel = hit.telemetry;
-    const integral = buildIntegralImage(fullLuma, frameW, frameH);
-    const fullBin = binarizeLuma(fullLuma, integral, frameW, frameH, false);
+    let fullBin: Uint8Array;
 
-    // Splice the decoded tile's binarized pixels back into full-frame telemetry view
-    const upW = tel.width;
-    const halfScale = scale >> 1;
-    for (let y = 0; y < tileH; y++) {
-      const uy = Math.min(tel.height - 1, y * scale + halfScale);
-      const dstRow = (ty + y) * frameW + tx;
-      const srcRow = uy * upW;
-      for (let x = 0; x < tileW; x++) {
-        const ux = Math.min(upW - 1, x * scale + halfScale);
-        fullBin[dstRow + x] = tel.binarized[srcRow + ux];
+    if (scale < 1) {
+      fullBin = new Uint8Array(frameW * frameH);
+      const srcW = tel.width;
+      const srcH = tel.height;
+      for (let y = 0; y < frameH; y++) {
+        const sy = Math.min(srcH - 1, (y * scale) | 0);
+        const srcRow = sy * srcW;
+        const dstRow = y * frameW;
+        for (let x = 0; x < frameW; x++) {
+          const sx = Math.min(srcW - 1, (x * scale) | 0);
+          fullBin[dstRow + x] = tel.binarized[srcRow + sx];
+        }
+      }
+    } else {
+      const integral = buildIntegralImage(fullLuma, frameW, frameH);
+      fullBin = binarizeLuma(fullLuma, integral, frameW, frameH, false);
+
+      // Splice the decoded tile's binarized pixels back into full-frame telemetry view
+      const upW = tel.width;
+      const halfScale = scale >> 1;
+      for (let y = 0; y < tileH; y++) {
+        const uy = Math.min(tel.height - 1, y * scale + halfScale);
+        const dstRow = (ty + y) * frameW + tx;
+        const srcRow = uy * upW;
+        for (let x = 0; x < tileW; x++) {
+          const ux = Math.min(upW - 1, x * scale + halfScale);
+          fullBin[dstRow + x] = tel.binarized[srcRow + ux];
+        }
       }
     }
 
@@ -166,13 +235,6 @@ function mapResultToFrame(
   return mapped;
 }
 
-interface TilePlan {
-  tileW: number;
-  tileH: number;
-  scale: number;
-  coords: { tx: number; ty: number; dist2: number }[];
-}
-
 export function scan(
   rgba: Uint8Array | Uint8ClampedArray,
   width: number,
@@ -186,31 +248,95 @@ export function scan(
   const startTime = performance.now();
   const maxTimeMs = opts.maxTimeMs ?? 1500;
   const maxWindows = opts.maxWindows ?? Infinity;
-  let windowsTried = 0;
+  if (maxTimeMs <= 0) return null;
 
   const fullLuma = rgbaToLuma(rgba, width, height);
+  const maxDim = width > height ? width : height;
+  const minDim = width < height ? width : height;
+  const totalPixels = width * height;
 
-  const direct = decodeLuma(fullLuma, width, height, opts);
-  if (direct) return direct;
+  if (maxDim <= 1600 && totalPixels <= MAX_U32_INTEGRAL_PIXELS) {
+    const direct = decodeLuma(fullLuma, width, height, opts);
+    if (direct) return direct;
+  } else {
+    const levels: PyramidLevel[] = [{ luma: fullLuma, width, height, factor: 1 }];
+    let curLuma = fullLuma;
+    let curW = width;
+    let curH = height;
+    let curFactor = 1;
 
+    while (
+      (Math.max(curW, curH) > 1600 || curW * curH > MAX_U32_INTEGRAL_PIXELS) &&
+      Math.min(curW, curH) >= 400
+    ) {
+      if (performance.now() - startTime >= maxTimeMs) return null;
+      const next = downsample2x(curLuma, curW, curH);
+      curLuma = next.luma;
+      curW = next.width;
+      curH = next.height;
+      curFactor <<= 1;
+      levels.push({ luma: curLuma, width: curW, height: curH, factor: curFactor });
+    }
+
+    let maxPyrPixels = 0;
+    let maxPyrIntLen = 0;
+    for (let i = 0; i < levels.length; i++) {
+      const lv = levels[i];
+      if (lv.factor === 1 && lv.width * lv.height > MAX_FULL_RES_DECODE_PIXELS) continue;
+      const px = lv.width * lv.height;
+      const il = (lv.width + 1) * (lv.height + 1);
+      if (px > maxPyrPixels) maxPyrPixels = px;
+      if (il > maxPyrIntLen) maxPyrIntLen = il;
+    }
+
+    const pyrBuffers =
+      maxPyrPixels > 0
+        ? {
+            integral: new Uint32Array(maxPyrIntLen),
+            binarized: new Uint8Array(maxPyrPixels),
+          }
+        : undefined;
+
+    for (let i = levels.length - 1; i >= 0; i--) {
+      const lv = levels[i];
+      if (lv.factor === 1 && lv.width * lv.height > MAX_FULL_RES_DECODE_PIXELS) continue;
+      if (performance.now() - startTime >= maxTimeMs) return null;
+
+      const hit = decodeLuma(lv.luma, lv.width, lv.height, {
+        debug: opts.debug,
+        tryInverted: opts.tryInverted,
+        buffers: pyrBuffers,
+      });
+      if (hit) {
+        if (lv.factor === 1) return hit;
+        return mapResultToFrame(hit, 0, 0, 1 / lv.factor, fullLuma, width, height, width, height);
+      }
+    }
+  }
+
+  let windowsTried = 0;
   if (performance.now() - startTime >= maxTimeMs || windowsTried >= maxWindows) {
     return null;
   }
 
-  const minDim = width < height ? width : height;
   const rawTiers: { winSize: number; scale: number }[] =
     minDim < 220
-      ? [{ winSize: Math.max(width, height), scale: minDim < 110 ? 3 : 2 }]
-      : [
-          { winSize: Math.max(160, Math.round(minDim * 0.28)), scale: 2 },
-          { winSize: Math.max(96, Math.round(minDim * 0.16)), scale: 3 },
-        ];
+      ? [{ winSize: maxDim, scale: minDim < 110 ? 3 : 2 }]
+      : maxDim > 2000
+        ? [
+            { winSize: Math.min(720, Math.round(minDim * 0.36)), scale: 1 },
+            { winSize: 280, scale: 2 },
+          ]
+        : [
+            { winSize: Math.max(160, Math.round(minDim * 0.28)), scale: 2 },
+            { winSize: Math.max(96, Math.round(minDim * 0.16)), scale: 3 },
+          ];
 
   const centerX = width * 0.5;
   const centerY = height * 0.5;
   const plans: TilePlan[] = [];
-  let maxUpW = 0;
-  let maxUpPixels = 0;
+  let maxWorkW = 0;
+  let maxWorkPixels = 0;
   let maxIntegralLen = 0;
 
   for (let t = 0; t < rawTiers.length; t++) {
@@ -236,23 +362,23 @@ export function scan(
     coords.sort((a, b) => a.dist2 - b.dist2);
     plans.push({ tileW, tileH, scale, coords });
 
-    const upW = tileW * scale;
-    const upH = tileH * scale;
-    if (upW > maxUpW) maxUpW = upW;
-    if (upW * upH > maxUpPixels) maxUpPixels = upW * upH;
-    const intLen = (upW + 1) * (upH + 1);
+    const workW = tileW * scale;
+    const workH = tileH * scale;
+    if (scale > 1 && workW > maxWorkW) maxWorkW = workW;
+    if (workW * workH > maxWorkPixels) maxWorkPixels = workW * workH;
+    const intLen = (workW + 1) * (workH + 1);
     if (intLen > maxIntegralLen) maxIntegralLen = intLen;
   }
 
   if (plans.length === 0) return null;
 
-  const upLuma = new Uint8Array(maxUpPixels);
-  const x0Lut = new Int32Array(maxUpW);
-  const x1Lut = new Int32Array(maxUpW);
-  const wxLut = new Uint16Array(maxUpW);
+  const tileLuma = new Uint8Array(maxWorkPixels);
+  const x0Lut = maxWorkW > 0 ? new Int32Array(maxWorkW) : new Int32Array(0);
+  const x1Lut = maxWorkW > 0 ? new Int32Array(maxWorkW) : new Int32Array(0);
+  const wxLut = maxWorkW > 0 ? new Uint16Array(maxWorkW) : new Uint16Array(0);
   const buffers = {
     integral: new Uint32Array(maxIntegralLen),
-    binarized: new Uint8Array(maxUpPixels),
+    binarized: new Uint8Array(maxWorkPixels),
   };
 
   const tryInverted = opts.tryInverted !== false;
@@ -263,9 +389,12 @@ export function scan(
 
     for (let t = 0; t < plans.length; t++) {
       const { tileW, tileH, scale, coords } = plans[t];
-      const upW = tileW * scale;
-      const upH = tileH * scale;
-      const windowRadius = Math.max(12, scale * 6);
+      const workW = tileW * scale;
+      const workH = tileH * scale;
+      const windowRadius =
+        scale === 1
+          ? Math.max(16, Math.min(64, Math.floor(Math.min(tileW, tileH) / 12)))
+          : Math.max(12, scale * 6);
 
       for (let i = 0; i < coords.length; i++) {
         if (performance.now() - startTime >= maxTimeMs || windowsTried >= maxWindows) {
@@ -278,9 +407,25 @@ export function scan(
         }
         windowsTried++;
 
-        upscaleTileBilinear(fullLuma, width, tx, ty, tileW, tileH, scale, upLuma, x0Lut, x1Lut, wxLut);
+        if (scale === 1) {
+          copyTile(fullLuma, width, tx, ty, tileW, tileH, tileLuma);
+        } else {
+          upscaleTileBilinear(
+            fullLuma,
+            width,
+            tx,
+            ty,
+            tileW,
+            tileH,
+            scale,
+            tileLuma,
+            x0Lut,
+            x1Lut,
+            wxLut
+          );
+        }
 
-        const hit = decodeLuma(upLuma, upW, upH, {
+        const hit = decodeLuma(tileLuma, workW, workH, {
           debug: opts.debug,
           tryInverted: false,
           invertOnly,

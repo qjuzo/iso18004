@@ -3,7 +3,9 @@ import test from 'node:test';
 import {
   ALIGNMENT_COORDS,
   EXP_TABLE,
+  MAX_U32_INTEGRAL_PIXELS,
   buildFunctionPatternMask,
+  buildIntegralImage,
   createBitMatrix,
   decode,
   decodeBitStream,
@@ -893,4 +895,107 @@ test('scan() locates small QR codes inside a noisy cluttered 1920x1080 frame acr
   }
 
   assert.equal(scan(baseScene, W, H, { maxTimeMs: 0 }), null);
+});
+
+test('buildIntegralImage switches to Float64Array past MAX_U32_INTEGRAL_PIXELS', () => {
+  assert.ok(MAX_U32_INTEGRAL_PIXELS * 255 <= 0xffffffff);
+  assert.ok((MAX_U32_INTEGRAL_PIXELS + 1) * 255 > 0xffffffff);
+
+  const side = 4105; // 16,851,025 > 16,843,009
+  const luma = new Uint8Array(side * side);
+  luma.fill(255);
+  const integral = buildIntegralImage(luma, side, side);
+  assert.ok(integral instanceof Float64Array);
+  assert.equal(integral[(side + 1) * side + side], side * side * 255);
+});
+
+test('scan() handles synthetic 4K (3840x2160) small, frame-filling, and skewed QR codes', () => {
+  const W = 3840;
+  const H = 2160;
+  const base4k = new Uint8Array(W * H * 4);
+  let seed = 0x517cc1b7;
+  for (let i = 0; i < base4k.length; i += 4) {
+    seed ^= seed << 13;
+    seed ^= seed >>> 17;
+    seed ^= seed << 5;
+    const v = 228 + ((seed >>> 0) % 19) - 9;
+    base4k[i] = v;
+    base4k[i + 1] = v;
+    base4k[i + 2] = v;
+    base4k[i + 3] = 255;
+  }
+
+  // 1. Small 96px V2 code near bottom-right of 4K frame
+  const smallPayload = '4k-small-96px-v2';
+  const smallMat = encodeUtf8ByteQR(smallPayload, 2, 'M', 3);
+  const smallFrame = compositeQR(base4k, W, H, smallMat, 3240, 1680, 96, 12);
+  const smallRes = scan(smallFrame, W, H);
+  assert.ok(smallRes, 'scan() missed small 96px code on 4K');
+  assert.equal(smallRes.text, smallPayload);
+  for (const pt of smallRes.corners) {
+    assert.ok(pt.x >= 3234 && pt.x <= 3342, `4K small corner.x=${pt.x} out of bounds`);
+    assert.ok(pt.y >= 1674 && pt.y <= 1782, `4K small corner.y=${pt.y} out of bounds`);
+  }
+
+  // 2. Large 1800px V4 code filling 4K vertical span
+  const largePayload = '4k-large-frame-filling-v4-payload';
+  const largeMat = encodeUtf8ByteQR(largePayload, 4, 'M', 2);
+  const largeFrame = compositeQR(base4k, W, H, largeMat, 1020, 180, 1800, 96);
+  const largeRes = scan(largeFrame, W, H, { debug: true });
+  assert.ok(largeRes, 'scan() missed large 1800px code on 4K');
+  assert.equal(largeRes.text, largePayload);
+  assert.equal(largeRes.telemetry?.width, W);
+  assert.equal(largeRes.telemetry?.height, H);
+  for (const pt of largeRes.corners) {
+    assert.ok(pt.x >= 1005 && pt.x <= 2835, `4K large corner.x=${pt.x} out of bounds`);
+    assert.ok(pt.y >= 165 && pt.y <= 1995, `4K large corner.y=${pt.y} out of bounds`);
+  }
+
+  // 3. Rotated and perspective-skewed V4 code on 4K
+  const skewPayload = '4k-rotated-skewed-v4';
+  const skewMat = encodeUtf8ByteQR(skewPayload, 4, 'Q', 5);
+  const skewDst: [Point, Point, Point, Point] = [
+    { x: 1680, y: 740 },
+    { x: 2240, y: 810 },
+    { x: 1590, y: 1290 },
+    { x: 2190, y: 1380 },
+  ];
+  const srcMod: [Point, Point, Point, Point] = [
+    { x: 0, y: 0 },
+    { x: skewMat.width, y: 0 },
+    { x: 0, y: skewMat.width },
+    { x: skewMat.width, y: skewMat.width },
+  ];
+  const invH = solveHomography(skewDst, srcMod)!;
+  const skewFrame = new Uint8Array(base4k);
+  for (let y = 700; y <= 1420; y++) {
+    for (let x = 1550; x <= 2280; x++) {
+      const mPt = projectPoint(invH, x + 0.5, y + 0.5);
+      const mc = Math.floor(mPt.x);
+      const mr = Math.floor(mPt.y);
+      const inBounds = mc >= -4 && mc < skewMat.width + 4 && mr >= -4 && mr < skewMat.width + 4;
+      if (!inBounds) continue;
+      const dark = mc >= 0 && mc < skewMat.width && mr >= 0 && mr < skewMat.width && getBit(skewMat, mc, mr) === 1;
+      const idx = (y * W + x) * 4;
+      const v = dark ? 16 : 244;
+      skewFrame[idx] = v;
+      skewFrame[idx + 1] = v;
+      skewFrame[idx + 2] = v;
+    }
+  }
+  const skewRes = scan(skewFrame, W, H);
+  assert.ok(skewRes, 'scan() missed rotated/skewed code on 4K');
+  assert.equal(skewRes.text, skewPayload);
+  const expectedOrder = [skewDst[0], skewDst[1], skewDst[3], skewDst[2]];
+  for (let i = 0; i < 4; i++) {
+    assert.ok(
+      Math.hypot(skewRes.corners[i].x - expectedOrder[i].x, skewRes.corners[i].y - expectedOrder[i].y) <= 18,
+      `4K skewed corner[${i}] drifted: (${skewRes.corners[i].x.toFixed(1)}, ${skewRes.corners[i].y.toFixed(1)})`
+    );
+  }
+
+  // 4. Time budget stops cleanly on blank/noisy 4K frame
+  const tBudget0 = performance.now();
+  assert.equal(scan(base4k, W, H, { maxTimeMs: 40 }), null);
+  assert.ok(performance.now() - tBudget0 < 400, '4K time budget did not exit promptly');
 });

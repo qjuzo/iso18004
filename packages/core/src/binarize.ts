@@ -1,3 +1,8 @@
+// 16,843,009 * 255 = 4,294,967,295 <= 0xffffffff; larger frames exceed uint32 integral sums
+export const MAX_U32_INTEGRAL_PIXELS = 16_843_009;
+
+export type IntegralImage = Uint32Array | Float64Array;
+
 export function rgbaToLuma(
   rgba: Uint8Array | Uint8ClampedArray,
   width: number,
@@ -16,11 +21,19 @@ export function buildIntegralImage(
   luma: Uint8Array,
   width: number,
   height: number,
-  out?: Uint32Array
-): Uint32Array {
+  out?: IntegralImage
+): IntegralImage {
+  const totalPixels = width * height;
   const stride = width + 1;
   const needed = stride * (height + 1);
-  const integral = out && out.length >= needed ? out : new Uint32Array(needed);
+  const integral: IntegralImage =
+    totalPixels > MAX_U32_INTEGRAL_PIXELS
+      ? out instanceof Float64Array && out.length >= needed
+        ? out
+        : new Float64Array(needed)
+      : out instanceof Uint32Array && out.length >= needed
+        ? out
+        : new Uint32Array(needed);
   integral.fill(0, 0, stride);
 
   for (let y = 0; y < height; y++) {
@@ -40,7 +53,7 @@ export function buildIntegralImage(
 
 export function binarizeLuma(
   luma: Uint8Array,
-  integral: Uint32Array,
+  integral: IntegralImage,
   width: number,
   height: number,
   invert = false,
@@ -51,9 +64,8 @@ export function binarizeLuma(
   const dst = out && out.length >= totalPixels ? out : new Uint8Array(totalPixels);
   const stride = width + 1;
 
-  // Symmetric local window covers >= 3-module finder cores while canceling linear lighting gradients
   const minDim = width < height ? width : height;
-  const radius = windowRadius ?? Math.max(12, Math.min(80, Math.floor(minDim / 10)));
+  const radius = windowRadius ?? Math.max(12, Math.min(240, Math.floor(minDim / 10)));
   const globalMean = integral[stride * height + width] / totalPixels;
 
   for (let y = 0; y < height; y++) {

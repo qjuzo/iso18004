@@ -1,4 +1,4 @@
-import { binarizeLuma, buildIntegralImage, rgbaToLuma } from './binarize.ts';
+import { binarizeLuma, buildIntegralImage, rgbaToLuma, type IntegralImage } from './binarize.ts';
 import { decodeBitStream } from './bitstream.ts';
 import { extractRawCodewords, readFormatInfo, readVersionInfo } from './format.ts';
 import {
@@ -14,7 +14,13 @@ import { deinterleaveAndCorrect } from './reed-solomon.ts';
 import type { BitMatrix, DecodeOptions, DecodeResult, FinderPattern, Point } from './types.ts';
 
 export * from './types.ts';
-export { binarizeLuma, buildIntegralImage, rgbaToLuma } from './binarize.ts';
+export {
+  MAX_U32_INTEGRAL_PIXELS,
+  binarizeLuma,
+  buildIntegralImage,
+  rgbaToLuma,
+  type IntegralImage,
+} from './binarize.ts';
 export { decodeBitStream } from './bitstream.ts';
 export {
   ALIGNMENT_COORDS,
@@ -272,7 +278,7 @@ function decodeBinarized(
 export interface DecodeLumaOptions extends DecodeOptions {
   windowRadius?: number;
   buffers?: {
-    integral: Uint32Array;
+    integral: IntegralImage;
     binarized: Uint8Array;
   };
   invertOnly?: boolean;
